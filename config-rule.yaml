@@ -1,0 +1,70 @@
+AWSTemplateFormatVersion: 2010-09-09
+Transform: 'AWS::Serverless-2016-10-31'
+Description: Builder Project - Network automation for TGW Route attachemnet association and propagation.
+
+Parameters:
+  pEnvironment:
+    AllowedValues:
+      - 'CI'
+      - 'Dev'
+      - 'Test'
+      - 'QA'
+      - 'Prod'
+      - 'HZ-SVC'
+      - 'MGMT'
+    Default: 'Dev'
+    Description: Environment Type
+    Type: String
+
+Resources:
+  rFSxConfigRule:
+    Type: 'AWS::Serverless::Function'
+    Properties:
+      Handler: fsx_config.lambda_handler
+      Runtime: python3.8
+      CodeUri: ./src
+      Description: Lambda for custom FSx config rule.
+      Tracing: Active
+      MemorySize: 256
+      Timeout: 15
+      Policies:
+          - CloudWatchPutMetricPolicy: {}
+          - Statement:
+            - Sid: CloudfomrationAllow
+              Effect: Allow
+              Action:
+              - fsx:*
+              - config:*
+              Resource: '*'
+      Environment:
+        Variables:
+          LAMBDA_INSIGHTS_LOG_LEVEL: info
+          LOGGING_LEVEL: info
+      AutoPublishAlias: !Ref pEnvironment
+
+  PermissionForConfigToInvokeLambda: 
+    Type: AWS::Lambda::Permission
+    Properties: 
+      FunctionName: !Ref rFSxConfigRule
+      Action: lambda:InvokeFunction
+      Principal: config.amazonaws.com
+      SourceAccount: !Ref AWS::AccountId
+
+  ConfigRuleForFSx: 
+      Type: AWS::Config::ConfigRule
+      Properties: 
+        ConfigRuleName: ConfigRuleForFSxFileSystemType
+        Scope: 
+            ComplianceResourceTypes: 
+            - "AWS::::Account"
+        Source: 
+          Owner: "CUSTOM_LAMBDA"
+          SourceDetails: 
+            - 
+                EventSource: "aws.config"
+                MessageType: "ScheduledNotification"
+          SourceIdentifier: 
+            Fn::GetAtt: 
+                - rFSxConfigRule
+                - Arn
+      DependsOn: PermissionForConfigToInvokeLambda

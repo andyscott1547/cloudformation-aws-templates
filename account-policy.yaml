@@ -1,0 +1,215 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: ''
+
+Parameters:
+  Contact:
+    Type: String
+    Default: andy.scott@pegasus-technology.co.uk
+    Description: Email account to send billing alarms to.
+
+Mappings:
+  RulePackageArn:
+    eu-west-1:
+      CVE: 'arn:aws:inspector:eu-west-1:357557129151:rulespackage/0-ubA5XvBh'
+      CIS: 'arn:aws:inspector:eu-west-1:357557129151:rulespackage/0-sJBhCr0F'
+      Network: 'arn:aws:inspector:eu-west-1:357557129151:rulespackage/0-SPzU33xe'
+      Security: 'arn:aws:inspector:eu-west-1:357557129151:rulespackage/0-SnojL3Z6'
+      Runtime: 'arn:aws:inspector:eu-west-1:357557129151:rulespackage/0-lLmwe1zd'
+
+Resources:
+  SnsTopic:
+    Type: 'AWS::SNS::Topic'
+    Properties:
+      Subscription:
+        - Endpoint: !Ref Contact
+          Protocol: email
+      TopicName: Account-Billing-Notification
+  CloudWatchAlarm:
+    Type: 'AWS::CloudWatch::Alarm'
+    Properties:
+      AlarmName: Account-Billing-Alarm
+      AlarmDescription: >-
+        A CloudWatch Alarm that triggers the AWS bill reaches the specified
+        threshold (default: 100 USD).
+      MetricName: EstimatedCharges
+      Namespace: AWS/Billing
+      Statistic: Maximum
+      Period: '21600'
+      EvaluationPeriods: '1'
+      Threshold: '100'
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      AlarmActions:
+        - Ref: SnsTopic
+      Dimensions:
+        - Name: Currency
+          Value: USD
+
+  S3SharedBucket:
+    Type: 'AWS::S3::Bucket'
+    Properties:
+      AccessControl: Private
+      BucketName: account-management-logs
+      LoggingConfiguration: {}
+      AccessControl: LogDeliveryWrite
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+  BucketPolicy:
+    Type: 'AWS::S3::BucketPolicy'
+    Properties:
+      Bucket:
+        Ref: S3SharedBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Principal:
+              Service: cloudtrail.amazonaws.com
+            Action:
+              - 's3:GetBucketAcl'
+            Resource:
+              - 'Fn::GetAtt':
+                  - S3SharedBucket
+                  - Arn
+            Effect: Allow
+            Condition: {}
+          - Principal:
+              Service: cloudtrail.amazonaws.com
+            Action:
+              - 's3:PutObject'
+            Resource:
+              - 'Fn::Join':
+                  - ''
+                  - - ''
+                    - 'Fn::GetAtt':
+                        - S3SharedBucket
+                        - Arn
+                    - /*
+            Effect: Allow
+            Condition:
+              StringEquals:
+                's3:x-amz-acl': bucket-owner-full-control
+    DependsOn: S3SharedBucket
+  CloudTrail:
+    Type: 'AWS::CloudTrail::Trail'
+    Properties:
+      TrailName: Account-Management-Trail
+      IsLogging: true
+      EnableLogFileValidation: true
+      EventSelectors:
+        - IncludeManagementEvents: true
+          ReadWriteType: All
+      IsMultiRegionTrail: true
+      IncludeGlobalServiceEvents: true
+      S3BucketName:
+        Ref: S3SharedBucket
+      CloudWatchLogsLogGroupArn:
+        'Fn::GetAtt':
+          - CloudWatchLogGroup
+          - Arn
+      CloudWatchLogsRoleArn:
+        'Fn::GetAtt':
+          - IamRoleForCwLogs
+          - Arn
+    DependsOn:
+      - BucketPolicy
+  CloudWatchLogGroup:
+    Type: 'AWS::Logs::LogGroup'
+    Properties:
+      LogGroupName: /Account/CloudTrailLogs
+  IamRoleForCwLogs:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      RoleName: !Sub Account-CloudTrail-Role-${AWS::Region}
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: ''
+            Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: 'sts:AssumeRole'
+      Policies:
+        - PolicyName: allow-access-to-cw-logs
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                Resource: '*'
+
+  CwEventAutoAssessment:
+    Type: 'AWS::Events::Rule'
+    Properties:
+      Name: InspectorScheduledAssessment
+      Description: 'Scheduled trigger for Amazon Inspector Assessment: '
+      State: ENABLED
+      Targets:
+        - Arn:
+            Ref: AssessmentTemplate
+          Id: AmazonInspectorAssessment
+          RoleArn:
+            'Fn::GetAtt':
+              - AutoAssessmentIamRole
+              - Arn
+      ScheduleExpression: cron(00 00 ? * SUN *)
+  AssessmentTarget:
+    Type: 'AWS::Inspector::AssessmentTarget'
+    Properties:
+      AssessmentTargetName: Amazon Inspector Targets
+  AssessmentTemplate:
+    Type: 'AWS::Inspector::AssessmentTemplate'
+    Properties:
+      AssessmentTargetArn:
+        Ref: AssessmentTarget
+      DurationInSeconds: 3600
+      RulesPackageArns:
+        - 'Fn::FindInMap':
+            - RulePackageArn
+            - Ref: 'AWS::Region'
+            - CVE
+        - 'Fn::FindInMap':
+            - RulePackageArn
+            - Ref: 'AWS::Region'
+            - CIS
+        - 'Fn::FindInMap':
+            - RulePackageArn
+            - Ref: 'AWS::Region'
+            - Network
+        - 'Fn::FindInMap':
+            - RulePackageArn
+            - Ref: 'AWS::Region'
+            - Security
+        - 'Fn::FindInMap':
+            - RulePackageArn
+            - Ref: 'AWS::Region'
+            - Runtime
+  AutoAssessmentIamRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      ManagedPolicyArns: []
+      Policies:
+        - PolicyName: InspectorAssessmentTrigger
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'inspector:StartAssessmentRun'
+                Resource: '*'
+      RoleName: !Sub Account-Inspector-Role-${AWS::Region}

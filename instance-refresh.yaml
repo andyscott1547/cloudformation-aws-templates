@@ -1,0 +1,87 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  "Sample solution to create a new launch template version with a new AMI created by EC2
+  Image Builder and trigger an Auto Scaling group instance refresh"
+
+Parameters:
+  Env:
+    Type: String
+    AllowedValues:
+      - 'Dev'
+      - 'QA'
+      - 'Prod'
+    Default: 'Dev'
+    Description: Environment Type
+
+Resources:
+  InstanceRefreshHandler:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      FunctionName: !Sub ${Env}-InstanceRefresh-Function
+      Handler: index.lambda_handler
+      Runtime: python3.7
+      MemorySize: 128
+      Timeout: 30
+      Role: !GetAtt InstanceRefreshHandlerLambdaRole.Arn
+      Code:
+        S3Bucket: pegasus-technology-image-build
+        S3Key: index.zip
+      Environment:
+        Variables:
+          AutoScalingGroupName:
+            Fn::ImportValue: !Sub ${Env}-Wordpress-ASG
+
+  InstanceRefreshHandlerLambdaRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      RoleName: !Sub ${Env}-InstanceRefresh-Role-${AWS::Region}
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - lambda.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      Path: "/service-role/"
+      Policies:
+      - PolicyName: lambdaExecution-InstanceRefreshHandler
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action:
+            - logs:CreateLogGroup
+            Resource: '*'
+          - Effect: Allow
+            Action:
+            - logs:CreateLogStream
+            - logs:PutLogEvents
+            Resource: '*'
+          - Effect: Allow
+            Action:
+            - autoscaling:StartInstanceRefresh
+            - autoscaling:Describe*
+            - ec2:CreateLaunchTemplateVersion
+            - ec2:DescribeLaunchTemplates
+            Resource: '*'
+
+  SNSLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+        FunctionName: !GetAtt InstanceRefreshHandler.Arn
+        Action: lambda:InvokeFunction
+        Principal: sns.amazonaws.com
+        SourceArn:
+          Fn::ImportValue: !Sub ${Env}-Wordpress-Image-Builder-SNS
+
+  SNSSubscription:
+    Type: 'AWS::SNS::Subscription'
+    Properties:
+      TopicArn:
+        Fn::ImportValue: !Sub ${Env}-Wordpress-Image-Builder-SNS
+      Endpoint: !GetAtt
+        - InstanceRefreshHandler
+        - Arn
+      Protocol: lambda

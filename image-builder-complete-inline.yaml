@@ -1,0 +1,356 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: 'ImageBuilder pipeline'
+
+Parameters:
+  Env:
+    Type: String
+    AllowedValues:
+      - 'Dev'
+      - 'QA'
+      - 'Prod'
+    Default: 'Dev'
+    Description: Environment Type
+
+  LatestAmiId:
+    Type: 'AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>'
+    Default: '/aws/service/canonical/ubuntu/server/18.04/stable/current/amd64/hvm/ebs-gp2/ami-id'
+
+  Contact:
+    Type: String
+    Default: andy.scott@pegasus-technology.co.uk
+    Description: Contact details for owner of this service
+
+Mappings:
+  Environments:
+    Dev:
+      VPCCIDR: 10.252.0.0/16
+      PublicSubnet: 10.252.254.0/24
+      S3Name: dev-image-builder-logs
+    QA:
+      VPCCIDR: 10.253.0.0/16
+      PublicSubnet: 10.253.254.0/24
+      S3Name: qa-image-builder-logs
+    Prod:
+      VPCCIDR: 10.254.0.0/16
+      PublicSubnet: 10.254.254.0/24
+      S3Name: prod-image-builder-logs
+
+Resources:
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !FindInMap [Environments, !Ref Env, VPCCIDR]
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value:  !Sub ${Env}-Image-Builder-VPC
+        - Key: Env
+          Value: !Sub ${Env}
+        - Key: Contact
+          Value: !Sub ${Contact}
+# Creates and attaches IGW
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    DependsOn: VPC
+  AttachGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+# Creates 3 Public subnets with public IPs
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !FindInMap [Environments, !Ref Env, PublicSubnet]
+      AvailabilityZone: !Select [ 0, !GetAZs ]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value:  !Sub ${Env}-Image-Builder-VPC
+        - Key: Env
+          Value: !Sub ${Env}
+        - Key: Contact
+          Value: !Sub ${Contact}
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value:  !Sub ${Env}-Image-Builder-Public-Route-Table
+        - Key: Env
+          Value: !Sub ${Env}
+        - Key: Contact
+          Value: !Sub ${Contact}
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: AttachGateway
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+# Asspociates public subnets to route table
+  PublicSubnetARouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet
+      RouteTableId: !Ref PublicRouteTable
+
+  ImageBuilderGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Image builder security group
+      GroupName: !Sub ${Env}-Image-Builder-SG
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value:  !Sub ${Env}-Image-Builder-VPC
+        - Key: Env
+          Value: !Sub ${Env}
+        - Key: Contact
+          Value: !Sub ${Contact}
+
+  ImageBuilderS3Bucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      AccessControl: Private
+      BucketName: !FindInMap [Environments, !Ref Env, S3Name]
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+    DeletionPolicy: Delete
+
+  ImageBuilderSNS:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub ${Env}-Image-Builder-Notification
+
+  ComponentAllParameters:
+    Type: 'AWS::ImageBuilder::Component'
+    Properties:
+      Name: !Sub ${Env}-Wordpress-Instance-Component
+      Platform: 'Linux'
+      Version: "1.1.0"
+      # Require one of 'Data' or 'Uri' for Component template
+      Data: |
+        name: Update-OS
+        description: Web server build
+        schemaVersion: 1.0
+
+        phases:
+          - name: build
+            steps:
+              - name: Update-OS
+                action: ExecuteBash
+                inputs:
+                  commands:
+                    - sudo su
+                    - apt-get update -y && apt-get upgrade -y
+              - name: Apache-Install-Start
+                action: ExecuteBash
+                inputs:
+                  commands:
+                    - apt-get install apache2 -y
+                    - systemctl start apache2
+                    - systemctl enable apache2
+              - name: AWScli-Install
+                action: ExecuteBash
+                inputs:
+                  commands:
+                    - apt install unzip -y
+                    - curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+                    - unzip awscliv2.zip
+                    - ./aws/install
+              - name: PHP-Install
+                action: ExecuteBash
+                inputs:
+                  commands:
+                    - add-apt-repository ppa:ondrej/php -y
+                    - apt-get update -y && apt-get upgrade -y
+                    - apt-get install php -y
+                    - apt-get install php-mysql -y
+                    - apt-get install php-common libapache2-mod-php php-fpm php-mbstring php-curl php-gd php-xml php-xmlrpc php-soap php-intl php-zip -y
+                    - a2enmod proxy_fcgi setenvif
+                    - a2enconf php7.4-fpm
+                    - systemctl restart apache2
+              - name: Generic-Package-Install
+                action: ExecuteBash
+                inputs:
+                  commands:
+                    - apt-get install nfs-common -y
+                    - apt install mysql-client -y
+                    - apt-get install git -y
+                    - apt-get update -y && apt-get upgrade -y
+                    - apt-get install libwww-perl libdatetime-perl -y
+                    - apt-get install jq -y
+                    - apt-get install cloud-utils -y
+                    - apt-get install python-pip -y
+                    - apt-get install python3-pip -y
+                    - apt-get install heat-cfntools -y
+                    - wget https://inspector-agent.amazonaws.com/linux/latest/install
+                    - sudo bash install
+              - name: Cloudformation-Custom-Scripts
+                action: ExecuteBash
+                inputs:
+                  commands:
+                    - apt-get install -y python-setuptools
+                    - mkdir -p /opt/aws/bin
+                    - wget https://s3.amazonaws.com/cloudformation-examples/aws-cfn-bootstrap-latest.tar.gz
+                    - python -m easy_install --script-dir /opt/aws/bin aws-cfn-bootstrap-latest.tar.gz
+                    - apt-get install heat-cfntools -y
+                    - curl -o amazon-cloudwatch-agent.deb https://s3.amazonaws.com/amazoncloudwatch-agent/debian/amd64/latest/amazon-cloudwatch-agent.deb
+                    - dpkg -i -E ./amazon-cloudwatch-agent.deb
+              - name: Pip-Boto3-Install
+                action: ExecuteBash
+                inputs:
+                  commands:
+                    - pip3 install boto3
+              - name: RebootStep
+                action: Reboot
+      Description: 'Build recipe for wordpress AMI'
+      ChangeDescription: 'Initial commit'
+      Tags:
+        Env: !Sub ${Env}
+        Contact: !Sub ${Contact}
+  ImageRecipeAllParameters:
+    Type: 'AWS::ImageBuilder::ImageRecipe'
+    DependsOn: ComponentAllParameters
+    Properties:
+      Name: !Sub ${Env}-Wordpress-Instance-Recipe
+      Version: '1.1.0'
+      ParentImage: !Ref LatestAmiId
+      Description: 'description'
+      Components:
+        - ComponentArn: !Ref ComponentAllParameters
+      Tags:
+        Env: !Sub ${Env}
+        Contact: !Sub ${Contact}
+  ImageBuilderRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      RoleName: !Sub ${Env}-ImageBuilder-Role-${AWS::Region}
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          -
+            Effect: "Allow"
+            Principal:
+              Service:
+                - "ec2.amazonaws.com"
+            Action:
+              - "sts:AssumeRole"
+      Path: "/"
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/EC2InstanceProfileForImageBuilder
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+
+  ImageBuilderRolePolicies:
+    Type: "AWS::IAM::Policy"
+    Properties:
+      PolicyName: !Sub ${Env}ImageBuilderPolicy
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          -
+            Effect: "Allow"
+            Action: "s3:PutObject"
+            Resource:
+              - 'Fn::Join':
+                  - ''
+                  - - ''
+                    - 'Fn::GetAtt':
+                        - ImageBuilderS3Bucket
+                        - Arn
+                    - /*
+      Roles:
+        -
+          Ref: "ImageBuilderRole"
+  ImageBuilderInstanceProfile:
+    Type: "AWS::IAM::InstanceProfile"
+    Properties:
+      Path: "/"
+      Roles:
+        -
+          Ref: "ImageBuilderRole"
+  InfrastructureConfigurationAll:
+    DependsOn: ImageBuilderInstanceProfile
+    Type: 'AWS::ImageBuilder::InfrastructureConfiguration'
+    Properties:
+      Name: !Sub ${Env}-Wordpress-Instance-Infrastructure-Configuration
+      InstanceProfileName: !Ref ImageBuilderInstanceProfile
+      Description: 'Infrastrcuture configuration for image builder pipeline'
+      InstanceTypes:
+        - 't2.micro'
+      Logging:
+        S3Logs:
+          S3BucketName: !Ref ImageBuilderS3Bucket
+      SnsTopicArn: !Ref ImageBuilderSNS
+      TerminateInstanceOnFailure: true
+      SecurityGroupIds:
+        - !Ref ImageBuilderGroup
+      SubnetId: !Ref PublicSubnet
+      Tags:
+        Env: !Sub ${Env}
+        Contact: !Sub ${Contact}
+  DistributionConfigurationAllParameters:
+    Type: 'AWS::ImageBuilder::DistributionConfiguration'
+    Properties:
+      Name: !Sub ${Env}-Wordpress-Distribution
+      Description: 'description'
+      Distributions:
+        - Region: 'eu-west-1'
+          AmiDistributionConfiguration:
+            Name: 'Wordpress-Golden-Image {{ imagebuilder:buildDate }}'
+            Description: 'golden WP image'
+            AmiTags:
+              Name: !Sub ${Env}-Wordpress-Golden-Image
+              Env: !Sub ${Env}
+              Contact: !Sub ${Contact}
+      Tags:
+        Env: !Sub ${Env}
+        Contact: !Sub ${Contact}
+  ImagePipelineAllParameters:
+    Type: 'AWS::ImageBuilder::ImagePipeline'
+    Properties:
+      Name: !Sub ${Env}-Wordpress-Pipeline
+      Description: 'Wordpress-pipeline'
+      ImageRecipeArn: !Ref ImageRecipeAllParameters
+      InfrastructureConfigurationArn: !Ref InfrastructureConfigurationAll
+      DistributionConfigurationArn: !Ref DistributionConfigurationAllParameters
+      ImageTestsConfiguration:
+        ImageTestsEnabled: false
+        TimeoutMinutes: 90
+      Status: 'ENABLED'
+      Tags:
+        Env: !Sub ${Env}
+        Contact: !Sub ${Contact}
+
+Outputs:
+  ComponentAllParameters:
+    Description: Wordpress-component
+    Value: !Ref ComponentAllParameters
+    Export:
+      Name: !Sub ${Env}-Wordpress-component
+  ImageRecipeAllParameters:
+    Description: Wordpress-recipe
+    Value: !Ref ImageRecipeAllParameters
+    Export:
+      Name: Wordpress-recipe
+  InfrastructureConfigurationAll:
+    Description: Wordpress-infrastructure
+    Value: !Ref InfrastructureConfigurationAll
+    Export:
+      Name: !Sub ${Env}-Wordpress-inf
+  ImageBuilderSNS:
+    Description: Wordpress-ImageBuilder-SNS
+    Value: !Ref ImageBuilderSNS
+    Export:
+      Name: !Sub ${Env}-Wordpress-Image-Builder-SNS

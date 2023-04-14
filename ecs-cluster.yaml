@@ -1,0 +1,699 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: >
+  This template deploys an ECS cluster to the already created VPC stack
+  using an Auto Scaling Group. A public and private load balancer is provisioned.
+
+Parameters:
+  InstanceType:
+    Description: Which instance type should we use to build the ECS cluster?
+    Type: String
+    Default: t2.micro
+
+  DesiredClusterSize:
+    Description: How many ECS hosts do you want to initially deploy?
+    Type: Number
+    Default: 1
+
+  ECSAMI:
+    Description: ECS-Optimized AMI ID
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ecs/optimized-ami/amazon-linux/recommended/image_id
+
+  Env:
+    AllowedValues:
+      - 'Dev'
+      - 'QA'
+      - 'Prod'
+    Default: 'Dev'
+    Description: Environment Type
+    Type: String
+
+Resources:
+  ECSCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub ${Env}-ECS-Cluster
+
+  ECSAutoScalingGroup:
+    DependsOn: ECSCluster
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      AutoScalingGroupName: !Sub ${Env}-ECS-ASG
+      VPCZoneIdentifier:
+        - Fn::ImportValue: !Sub ${Env}-PrivateSubnetA
+        - Fn::ImportValue: !Sub ${Env}-PrivateSubnetB
+        - Fn::ImportValue: !Sub ${Env}-PrivateSubnetC
+      LaunchTemplate:
+        LaunchTemplateId: !Ref ECSLaunchConfiguration
+        Version: !GetAtt ECSLaunchConfiguration.LatestVersionNumber
+      MinSize: "1"
+      MaxSize: "3"
+      DesiredCapacity: !Ref DesiredClusterSize
+      Tags:
+        - Key: Name
+          Value: !Sub ${Env}-ECS-host
+          PropagateAtLaunch: true
+    CreationPolicy:
+      ResourceSignal:
+        Timeout: PT15M
+    UpdatePolicy:
+      AutoScalingRollingUpdate:
+        MinInstancesInService: 1
+        MaxBatchSize: 1
+        PauseTime: PT15M
+        SuspendProcesses:
+          - HealthCheck
+          - ReplaceUnhealthy
+          - AZRebalance
+          - AlarmNotification
+          - ScheduledActions
+        WaitOnResourceSignals: true
+
+  ECSLaunchConfiguration:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub ${Env}-ECS-LT
+      LaunchTemplateData:
+        ImageId: !Ref ECSAMI
+        InstanceType: !Ref InstanceType
+        SecurityGroupIds:
+          - Fn::ImportValue: !Sub ${Env}-VPC-SG
+          - !Ref ECSSG
+        IamInstanceProfile:
+          Name: !Ref ECSInstanceProfile
+        UserData:
+          "Fn::Base64": !Sub |
+            #!/bin/bash
+            yum install -y amazon-efs-utils
+            yum install -y nfs-utils
+            yum install -y https://s3.amazonaws.com/ec2-downloads-windows/SSMAgent/latest/linux_amd64/amazon-ssm-agent.rpm
+            yum install -y https://s3.amazonaws.com/amazoncloudwatch-agent/amazon_linux/amd64/latest/amazon-cloudwatch-agent.rpm
+            yum install -y aws-cfn-bootstrap hibagent
+            /opt/aws/bin/cfn-init -v --region ${AWS::Region} --stack ${AWS::StackName} --resource ECSLaunchConfiguration
+            /opt/aws/bin/cfn-signal -e $? --region ${AWS::Region} --stack ${AWS::StackName} --resource ECSAutoScalingGroup
+            /usr/bin/enable-ec2-spot-hibernation
+
+
+    Metadata:
+      AWS::CloudFormation::Init:
+        config:
+          packages:
+            yum:
+              collectd: []
+              aws-cli: []
+              jq: []
+              ecs-init: []
+              nfs-utils: []
+          commands:
+            01_add_instance_to_cluster:
+              command: !Sub echo ECS_CLUSTER=${ECSCluster} >> /etc/ecs/ecs.config
+            02_enable_cloudwatch_agent:
+              command: !Sub /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl -a fetch-config -m ec2 -c ssm:${ECSCloudWatchParameter} -s
+            03_start_ecs_agent:
+              command: start ecs
+          files:
+            /etc/cfn/cfn-hup.conf:
+              mode: 000400
+              owner: root
+              group: root
+              content: !Sub |
+                [main]
+                stack=${AWS::StackId}
+                region=${AWS::Region}
+            /etc/cfn/hooks.d/cfn-auto-reloader.conf:
+              content: !Sub |
+                [cfn-auto-reloader-hook]
+                triggers=post.update
+                path=Resources.ECSLaunchConfiguration.Metadata.AWS::CloudFormation::Init
+                action=/opt/aws/bin/cfn-init -v --region ${AWS::Region} --stack ${AWS::StackName} --resource ECSLaunchConfiguration
+          services:
+            sysvinit:
+              cfn-hup:
+                enabled: true
+                ensureRunning: true
+                files:
+                  - /etc/cfn/cfn-hup.conf
+                  - /etc/cfn/hooks.d/cfn-auto-reloader.conf
+
+  # This IAM Role is attached to all of the ECS hosts. It is based on the default role
+  # published here:
+  # http://docs.aws.amazon.com/AmazonECS/latest/developerguide/instance_IAM_role.html
+  #
+  # You can add other IAM policy statements here to allow access from your ECS hosts
+  # to other AWS services. Please note that this role will be used by ALL containers
+  # running on the ECS host.
+
+  ECSRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Path: /
+      RoleName: !Sub ${Env}-ECS-Instance-Role-${AWS::Region}
+      AssumeRolePolicyDocument: |
+        {
+            "Statement": [{
+                "Action": "sts:AssumeRole",
+                "Effect": "Allow",
+                "Principal": {
+                    "Service": "ec2.amazonaws.com"
+                }
+            }]
+        }
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonEC2RoleforSSM
+        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+        - arn:aws:iam::aws:policy/service-role/AmazonEC2ContainerServiceforEC2Role
+        - arn:aws:iam::aws:policy/AmazonElasticFileSystemReadOnlyAccess
+      Policies:
+        - PolicyName: ecs-service
+          PolicyDocument: |
+            {
+                "Statement": [{
+                    "Effect": "Allow",
+                    "Action": [
+                        "ecs:CreateCluster",
+                        "ecs:DeregisterContainerInstance",
+                        "ecs:DiscoverPollEndpoint",
+                        "ecs:Poll",
+                        "ecs:RegisterContainerInstance",
+                        "ecs:StartTelemetrySession",
+                        "ecs:Submit*",
+                        "ecr:BatchCheckLayerAvailability",
+                        "ecr:BatchGetImage",
+                        "ecr:GetDownloadUrlForLayer",
+                        "ecr:GetAuthorizationToken",
+                        "ssm:GetParameter"
+                    ],
+                    "Resource": "*"
+                }]
+            }
+
+  ECSInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Path: /
+      Roles:
+        - !Ref ECSRole
+
+  ECSServiceAutoScalingRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${Env}-ECS-AutoScaling-Role-${AWS::Region}
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          Action:
+            - "sts:AssumeRole"
+          Effect: Allow
+          Principal:
+            Service:
+              - application-autoscaling.amazonaws.com
+      Path: /
+      Policies:
+        - PolicyName: ecs-service-autoscaling
+          PolicyDocument:
+            Statement:
+              Effect: Allow
+              Action:
+                - application-autoscaling:*
+                - cloudwatch:DescribeAlarms
+                - cloudwatch:PutMetricAlarm
+                - ecs:DescribeServices
+                - ecs:UpdateService
+              Resource: "*"
+
+  ECSCloudWatchParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Description: ECS
+      Name: !Sub "/${Env}/ECS-Cluster/Cloudwatch-Config"
+      Type: String
+      Value: !Sub |
+        {
+          "logs": {
+            "force_flush_interval": 5,
+            "logs_collected": {
+              "files": {
+                "collect_list": [
+                  {
+                    "file_path": "/var/log/messages",
+                    "log_group_name": "${ECSCluster}-/var/log/messages",
+                    "log_stream_name": "{instance_id}",
+                    "timestamp_format": "%b %d %H:%M:%S"
+                  },
+                  {
+                    "file_path": "/var/log/dmesg",
+                    "log_group_name": "${ECSCluster}-/var/log/dmesg",
+                    "log_stream_name": "{instance_id}"
+                  },
+                  {
+                    "file_path": "/var/log/docker",
+                    "log_group_name": "${ECSCluster}-/var/log/docker",
+                    "log_stream_name": "{instance_id}",
+                    "timestamp_format": "%Y-%m-%dT%H:%M:%S.%f"
+                  },
+                  {
+                    "file_path": "/var/log/ecs/ecs-init.log",
+                    "log_group_name": "${ECSCluster}-/var/log/ecs/ecs-init.log",
+                    "log_stream_name": "{instance_id}",
+                    "timestamp_format": "%Y-%m-%dT%H:%M:%SZ"
+                  },
+                  {
+                    "file_path": "/var/log/ecs/ecs-agent.log.*",
+                    "log_group_name": "${ECSCluster}-/var/log/ecs/ecs-agent.log",
+                    "log_stream_name": "{instance_id}",
+                    "timestamp_format": "%Y-%m-%dT%H:%M:%SZ"
+                  },
+                  {
+                    "file_path": "/var/log/ecs/audit.log",
+                    "log_group_name": "${ECSCluster}-/var/log/ecs/audit.log",
+                    "log_stream_name": "{instance_id}",
+                    "timestamp_format": "%Y-%m-%dT%H:%M:%SZ"
+                  }
+                ]
+              }
+            }
+          },
+          "metrics": {
+            "append_dimensions": {
+              "AutoScalingGroupName": "${!aws:AutoScalingGroupName}",
+              "InstanceId": "${!aws:InstanceId}",
+              "InstanceType": "${!aws:InstanceType}"
+            },
+            "metrics_collected": {
+              "collectd": {
+                "metrics_aggregation_interval": 60
+              },
+              "disk": {
+                "measurement": [
+                  "used_percent"
+                ],
+                "metrics_collection_interval": 60,
+                "resources": [
+                  "/"
+                ]
+              },
+              "mem": {
+                "measurement": [
+                  "mem_used_percent"
+                ],
+                "metrics_collection_interval": 60
+              },
+              "statsd": {
+                "metrics_aggregation_interval": 60,
+                "metrics_collection_interval": 10,
+                "service_address": ":8125"
+              }
+            }
+          }
+        }
+
+  NotificationTopic:
+    Type: "AWS::SNS::Topic"
+    Properties:
+      TopicName: !Sub ${Env}-ECS-Lifecycle-Notification
+      Subscription:
+        - Endpoint: !GetAtt
+            - LifecycleHandlerFunction
+            - Arn
+          Protocol: lambda
+    DependsOn: LifecycleHandlerFunction
+  InstanceTerminatingHook:
+    Type: "AWS::AutoScaling::LifecycleHook"
+    Properties:
+      AutoScalingGroupName: !Ref ECSAutoScalingGroup
+      DefaultResult: ABANDON
+      HeartbeatTimeout: "900"
+      LifecycleTransition: "autoscaling:EC2_INSTANCE_TERMINATING"
+      NotificationTargetARN: !Ref NotificationTopic
+      RoleARN: !GetAtt
+        - AutoscalingNotificationRole
+        - Arn
+    DependsOn: NotificationTopic
+  AutoscalingNotificationRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      RoleName: !Sub "${Env}-ECS-Notification-Role-${AWS::Region}"
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - autoscaling.amazonaws.com
+            Action:
+              - "sts:AssumeRole"
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/service-role/AutoScalingNotificationAccessRole"
+  LambdaExecutionRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      RoleName: !Sub "${Env}-ECS-LambdaExecution-Role-${AWS::Region}"
+      Policies:
+        - PolicyName: lambda-inline
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "autoscaling:CompleteLifecycleAction"
+                  - "logs:CreateLogGroup"
+                  - "logs:CreateLogStream"
+                  - "logs:PutLogEvents"
+                  - "ec2:DescribeInstances"
+                  - "ec2:DescribeInstanceAttribute"
+                  - "ec2:DescribeInstanceStatus"
+                  - "ec2:DescribeHosts"
+                  - "ecs:ListContainerInstances"
+                  - "ecs:SubmitContainerStateChange"
+                  - "ecs:SubmitTaskStateChange"
+                  - "ecs:DescribeContainerInstances"
+                  - "ecs:UpdateContainerInstancesState"
+                  - "ecs:ListTasks"
+                  - "ecs:DescribeTasks"
+                  - "sns:Publish"
+                  - "sns:ListSubscriptions"
+                Resource: "*"
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - "sts:AssumeRole"
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/service-role/AutoScalingNotificationAccessRole"
+  LambdaInvokePermission:
+    Type: "AWS::Lambda::Permission"
+    Properties:
+      FunctionName: !Ref LifecycleHandlerFunction
+      Action: "lambda:InvokeFunction"
+      Principal: sns.amazonaws.com
+      SourceArn: !Ref NotificationTopic
+  LifecycleHandlerFunction:
+    Type: "AWS::Lambda::Function"
+    Properties:
+      FunctionName: !Sub ${Env}-ECS-Lifecycle-Function
+      Environment:
+        Variables:
+          CLUSTER: !Ref ECSCluster
+      Code:
+        ZipFile: !Join
+          - ""
+          - - |
+              import boto3,json,os,time
+              ec2Client = boto3.client('ec2')
+              ecsClient = boto3.client('ecs')
+              autoscalingClient = boto3.client('autoscaling')
+              snsClient = boto3.client('sns')
+              lambdaClient = boto3.client('lambda')
+              def publishSNSMessage(snsMessage,snsTopicArn):
+                  response = snsClient.publish(TopicArn=snsTopicArn,Message=json.dumps(snsMessage),Subject='reinvoking')
+              def setContainerInstanceStatusToDraining(ecsClusterName,containerInstanceArn):
+                  response = ecsClient.update_container_instances_state(cluster=ecsClusterName,containerInstances=[containerInstanceArn],status='DRAINING')
+              def tasksRunning(ecsClusterName,ec2InstanceId):
+                  ecsContainerInstances = ecsClient.describe_container_instances(cluster=ecsClusterName,containerInstances=ecsClient.list_container_instances(cluster=ecsClusterName)['containerInstanceArns'])['containerInstances']
+                  for i in ecsContainerInstances:
+                      if i['ec2InstanceId'] == ec2InstanceId:
+                          if i['status'] == 'ACTIVE':
+                              setContainerInstanceStatusToDraining(ecsClusterName,i['containerInstanceArn'])
+                              return 1
+                          if (i['runningTasksCount']>0) or (i['pendingTasksCount']>0):
+                              return 1
+                          return 0
+                  return 2
+              def lambda_handler(event, context):
+                  ecsClusterName=os.environ['CLUSTER']
+                  snsTopicArn=event['Records'][0]['Sns']['TopicArn']
+                  snsMessage=json.loads(event['Records'][0]['Sns']['Message'])
+                  lifecycleHookName=snsMessage['LifecycleHookName']
+                  lifecycleActionToken=snsMessage['LifecycleActionToken']
+                  asgName=snsMessage['AutoScalingGroupName']
+                  ec2InstanceId=snsMessage['EC2InstanceId']
+                  checkTasks=tasksRunning(ecsClusterName,ec2InstanceId)
+                  if checkTasks==0:
+                      try:
+                          response = autoscalingClient.complete_lifecycle_action(LifecycleHookName=lifecycleHookName,AutoScalingGroupName=asgName,LifecycleActionToken=lifecycleActionToken,LifecycleActionResult='CONTINUE')
+                      except BaseException as e:
+                          print(str(e))
+                  elif checkTasks==1:
+                      time.sleep(5)
+                      publishSNSMessage(snsMessage,snsTopicArn)
+      Handler: index.lambda_handler
+      Role: !GetAtt
+        - LambdaExecutionRole
+        - Arn
+      Runtime: python3.6
+      Timeout: 10
+
+  ECSLoadBalancerSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: ECS LB Web Traffic
+      GroupName: !Sub ${Env}-ECS-Web-Traffic-SG
+      VpcId:
+        Fn::ImportValue: !Sub ${Env}-VPC
+      Tags:
+        - Key: Name
+          Value: !Sub ${Env}-ECS-Web-Traffic-SG
+      SecurityGroupIngress:
+        -
+          IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+        -
+          IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+
+  ECSSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: ECS LB LB Traffic
+      GroupName: !Sub ${Env}-ECS-LB-Traffic-SG
+      VpcId:
+        Fn::ImportValue: !Sub ${Env}-VPC
+      Tags:
+        - Key: Name
+          Value: !Sub ${Env}-ECS-LB-Traffic-SG
+  EcsSecurityGroupIngressFromLB:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      Description: Ingress from other containers in the same security group
+      GroupId: !Ref ECSSG
+      IpProtocol: tcp
+      FromPort: 80
+      ToPort: 80
+      SourceSecurityGroupId: !Ref ECSLoadBalancerSG
+
+  PublicLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Scheme: internet-facing
+      LoadBalancerAttributes:
+      - Key: idle_timeout.timeout_seconds
+        Value: '30'
+      Name: !Sub ${Env}-ECS-Public-LB
+      Subnets:
+        - Fn::ImportValue: !Sub ${Env}-PublicSubnetA
+        - Fn::ImportValue: !Sub ${Env}-PublicSubnetB
+        - Fn::ImportValue: !Sub ${Env}-PublicSubnetC
+      SecurityGroups:
+        - !Ref ECSLoadBalancerSG
+
+  DummyTargetGroupPublic:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      HealthCheckIntervalSeconds: 6
+      HealthCheckPath: /
+      HealthCheckProtocol: HTTP
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      Name: !Sub ${Env}-Default-Public-ECS-TG
+      Port: 80
+      Protocol: HTTP
+      UnhealthyThresholdCount: 2
+      VpcId:
+        Fn::ImportValue: !Sub ${Env}-VPC
+
+  PublicLoadBalancerListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    DependsOn:
+      - PublicLoadBalancer
+    Properties:
+      DefaultActions:
+        - TargetGroupArn: !Ref 'DummyTargetGroupPublic'
+          Type: 'forward'
+      LoadBalancerArn: !Ref 'PublicLoadBalancer'
+      Port: 80
+      Protocol: HTTP
+
+  PrivateLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Scheme: internal
+      LoadBalancerAttributes:
+      - Key: idle_timeout.timeout_seconds
+        Value: '30'
+      Name: !Sub ${Env}-ECS-Private-LB
+      Subnets:
+        - Fn::ImportValue: !Sub ${Env}-PrivateSubnetA
+        - Fn::ImportValue: !Sub ${Env}-PrivateSubnetB
+        - Fn::ImportValue: !Sub ${Env}-PrivateSubnetC
+      SecurityGroups:
+        - Fn::ImportValue: !Sub ${Env}-VPC-SG
+
+  DummyTargetGroupPrivate:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      HealthCheckIntervalSeconds: 6
+      HealthCheckPath: /
+      HealthCheckProtocol: HTTP
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      Name: !Sub ${Env}-Default-Private-ECS-TG
+      Port: 80
+      Protocol: HTTP
+      UnhealthyThresholdCount: 2
+      VpcId:
+        Fn::ImportValue: !Sub ${Env}-VPC
+
+  PrivateLoadBalancerListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    DependsOn:
+      - PrivateLoadBalancer
+    Properties:
+      DefaultActions:
+        - TargetGroupArn: !Ref DummyTargetGroupPrivate
+          Type: 'forward'
+      LoadBalancerArn: !Ref PrivateLoadBalancer
+      Port: 80
+      Protocol: HTTP
+
+
+#  ECSScaleUpPolicy:
+#    Type: AWS::AutoScaling::ScalingPolicy
+#    Properties:
+#      AdjustmentType: ChangeInCapacity
+#      AutoScalingGroupName: !Ref ECSAutoScalingGroup
+#      Cooldown: '60'
+#      ScalingAdjustment: 1
+#
+#  ECSScaleDownPolicy:
+#    Type: AWS::AutoScaling::ScalingPolicy
+#    Properties:
+#      AdjustmentType: ChangeInCapacity
+#      AutoScalingGroupName: !Ref ECSAutoScalingGroup
+#      Cooldown: '60'
+#      ScalingAdjustment: -1
+#
+#  CPUAlarmHigh:
+#    Type: AWS::CloudWatch::Alarm
+#    Properties:
+#      AlarmDescription: Scale-up if CPU > 90% for 10 minutes
+#      MetricName: CPUUtilization
+#      Namespace: AWS/EC2
+#      Statistic: Average
+#      Period: 300
+#      EvaluationPeriods: 2
+#      Threshold: 90
+#      AlarmActions: [!Ref 'ECSScaleUpPolicy']
+#      Dimensions:
+#      - Name: AutoScalingGroupName
+#        Value: !Ref 'ECSAutoScalingGroup'
+#      ComparisonOperator: GreaterThanThreshold
+#
+#  CPUAlarmLow:
+#    Type: AWS::CloudWatch::Alarm
+#    Properties:
+#      AlarmDescription: Scale-down if CPU < 70% for 10 minutes
+#      MetricName: CPUUtilization
+#      Namespace: AWS/EC2
+#      Statistic: Average
+#      Period: 300
+#      EvaluationPeriods: 2
+#      Threshold: 70
+#      AlarmActions: [!Ref 'ECSScaleDownPolicy']
+#      Dimensions:
+#      - Name: AutoScalingGroupName
+#        Value: !Ref 'ECSAutoScalingGroup'
+#      ComparisonOperator: LessThanThreshold
+#
+#  ECSCapacityProvider:
+#    Type: AWS::ECS::CapacityProvider
+#    Properties:
+#      Name: !Sub ${Env}-Capacity-Provider
+#      AutoScalingGroupProvider:
+#        AutoScalingGroupArn: arn:aws:autoscaling:eu-west-1:463261883801:autoScalingGroup:ea58b276-c45b-4a4e-b4f1-5d3ada88c327:autoScalingGroupName/Dev-ECS-ASG
+#        ManagedScaling:
+#            MaximumScalingStepSize: 10
+#            MinimumScalingStepSize: 1
+#            Status: ENABLED
+#            TargetCapacity: 100
+#      Tags:
+#        - Key: Env
+#          Value: !Sub ${Env}
+
+Outputs:
+  Cluster:
+    Description: A reference to the ECS cluster
+    Value: !Ref ECSCluster
+    Export:
+      Name: !Sub ${Env}-ECS-Cluster
+
+  ECSServiceAutoScalingRole:
+    Description: A reference to ECS service auto scaling role
+    Value: !GetAtt ECSServiceAutoScalingRole.Arn
+    Export:
+      Name: !Sub ${Env}-ECS-AutoScaling-Role
+
+  ECSAutoScalingGroupName:
+    Description: A reference to ECS AutoScaling Group Name
+    Value: !Ref ECSAutoScalingGroup
+    Export:
+      Name: !Sub ${Env}-AutoScaling-Group
+
+  PublicListener:
+    Description: The ARN of the public load balancer's Listener
+    Value: !Ref PublicLoadBalancerListener
+    Export:
+      Name: !Sub ${Env}-Public-Listener
+
+  PrivateListener:
+    Description: The ARN of the private load balancer's Listener
+    Value: !Ref PrivateLoadBalancerListener
+    Export:
+      Name: !Sub ${Env}-Private-Listener
+
+  ExternalUrl:
+    Description: The url of the external load balancer
+    Value: !Join ['', ['http://', !GetAtt 'PublicLoadBalancer.DNSName']]
+    Export:
+      Name: !Sub ${Env}-External-URL
+
+  ExternalDNS:
+    Description: The url of the internal load balancer
+    Value: !GetAtt PublicLoadBalancer.DNSName
+    Export:
+      Name: !Sub ${Env}-Public-DNS-Name
+
+  InternalUrl:
+    Description: The url of the internal load balancer
+    Value: !Join ['', ['http://', !GetAtt 'PrivateLoadBalancer.DNSName']]
+    Export:
+      Name: !Sub ${Env}-Internal-URL
+
+  InternalDNS:
+    Description: The url of the Internal load balancer
+    Value: !GetAtt PrivateLoadBalancer.DNSName
+    Export:
+      Name: !Sub ${Env}-Private-DNS-Name
+
+  ECSRole:
+    Description: The ARN of the ECS role
+    Value: !GetAtt 'ECSRole.Arn'
+    Export:
+      Name: !Sub ${Env}-ECS-EC2-Role

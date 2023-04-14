@@ -1,0 +1,554 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: Jenkins blog ec2
+
+Parameters:
+  AMIID:
+    Type: String
+    Default: ami-0047e3f0f335feeb8
+    Description: AMI ID used for initial deployment
+  Env:
+    AllowedValues:
+      - 'Dev'
+      - 'QA'
+      - 'Prod'
+      - 'HZ-SVC'
+    Default: 'Dev'
+    Description: Environment Type
+    Type: String
+  DesiredInstanceNumber:
+    Type: String
+    Default: '1'
+    Description: Number of running instances at launch
+
+Resources:
+
+  JenkinsEFS:
+    Type: 'AWS::EFS::FileSystem'
+    Properties:
+      BackupPolicy:
+        Status: ENABLED
+      PerformanceMode: generalPurpose
+      Encrypted: true
+      FileSystemTags:
+        - Key: Name
+          Value: !Sub HA-Jenkins-${Env}-EFS
+        - Key: Env
+          Value: !Sub ${Env}
+
+  MountTargetResource1:
+    Type: AWS::EFS::MountTarget
+    DependsOn: JenkinsEFS
+    Properties:
+      FileSystemId: !Ref JenkinsEFS
+      SubnetId:
+        Fn::ImportValue: !Sub ${Env}-PrivateSubnetA
+      SecurityGroups:
+        - Fn::ImportValue: !Sub ${Env}-VPC-SG
+
+  MountTargetResource2:
+    Type: AWS::EFS::MountTarget
+    DependsOn: JenkinsEFS
+    Properties:
+      FileSystemId: !Ref JenkinsEFS
+      SubnetId:
+        Fn::ImportValue: !Sub ${Env}-PrivateSubnetB
+      SecurityGroups:
+      - Fn::ImportValue: !Sub ${Env}-VPC-SG
+
+  MountTargetResource3:
+    Type: AWS::EFS::MountTarget
+    DependsOn: JenkinsEFS
+    Properties:
+      FileSystemId: !Ref JenkinsEFS
+      SubnetId:
+        Fn::ImportValue: !Sub ${Env}-PrivateSubnetC
+      SecurityGroups:
+      - Fn::ImportValue: !Sub ${Env}-VPC-SG
+
+  JenkinsLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    DependsOn:
+      - LBGroup
+      - JenkinsEC2InstanceProfile
+      - MountTargetResource1
+      - MountTargetResource2
+      - MountTargetResource3
+    Properties:
+      LaunchTemplateName: !Sub Jenkins-${Env}-Launch-Template
+      LaunchTemplateData:
+        InstanceType: t3.medium
+        DisableApiTermination: 'true'
+        IamInstanceProfile:
+          Name: !Ref JenkinsEC2InstanceProfile
+        ImageId: !Sub ${AMIID}
+        SecurityGroupIds:
+        - !Ref LBGroup
+        - Fn::ImportValue: !Sub ${Env}-VPC-SG
+        UserData:
+          "Fn::Base64": !Sub |
+            #!/bin/bash -ex
+
+            export Env=${Env}
+            wget -q -O - https://pkg.jenkins.io/debian/jenkins.io.key | sudo apt-key add -
+            sh -c 'echo deb http://pkg.jenkins.io/debian-stable binary/ > /etc/apt/sources.list.d/jenkins.list'
+            add-apt-repository universe
+            apt-get update -y && apt-get upgrade -y
+            mkdir /efs
+            apt-get install jenkins -y
+
+            export FSID=$(aws efs describe-file-systems | jq '.FileSystems[] | select(.Name == "HA-Jenkins-${Env}-EFS")' | jq '. | .FileSystemId' -r )
+            echo $FSID.efs.eu-west-2.amazonaws.com:/ /var/lib/jenkins/jobs nfs4 defaults,_netdev 0 0 >> /etc/fstab
+            mount -t nfs -o nfsvers=4.1,rsize=1048576,wsize=1048576,hard,timeo=600,retrans=2,noresvport $FSID.efs.eu-west-2.amazonaws.com:/ /efs
+
+            service jenkins stop
+            chown root:root /efs/jenkins-config
+            rm -f /etc/default/jenkins
+            cp /efs/jenkins-config /etc/default/jenkins
+            chown -R jenkins:jenkins /efs
+            usermod -d /efs jenkins
+            service jenkins start
+
+            /opt/aws/bin/cfn-init -v --stack ${AWS::StackId} --resource JenkinsLaunchTemplate --region ${AWS::Region}
+            /opt/aws/bin/cfn-signal -e $? --stack ${AWS::StackId} --resource JenkinsASG --region ${AWS::Region}
+
+    Metadata:
+      AWS::CloudFormation::Init:
+        configSets:
+          default:
+            - 01_setupCfnHup
+            - 02_config-amazon-cloudwatch-agent
+            - 03_restart_amazon-cloudwatch-agent
+          UpdateEnvironment:
+            - 02_config-amazon-cloudwatch-agent
+            - 03_restart_amazon-cloudwatch-agent
+        # Definition of json configuration of AmazonCloudWatchAgent, you can change the configuration below.
+        02_config-amazon-cloudwatch-agent:
+          files:
+            '/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json':
+              content: !Sub |
+                {
+                  "metrics": {
+                    "append_dimensions": {
+                      "AutoScalingGroupName": "${!aws:AutoScalingGroupName}",
+                      "ImageId": "${!aws:ImageId}",
+                      "InstanceId": "${!aws:InstanceId}",
+                      "InstanceType": "${!aws:InstanceType}"
+                    },
+                    "metrics_collected": {
+                      "cpu": {
+                        "measurement": [
+                          "cpu_usage_idle",
+                          "cpu_usage_iowait",
+                          "cpu_usage_user",
+                          "cpu_usage_system"
+                        ],
+                        "metrics_collection_interval": 30,
+                        "totalcpu": false
+                      },
+                      "disk": {
+                        "measurement": [
+                          "used_percent",
+                          "inodes_free"
+                        ],
+                        "metrics_collection_interval": 30,
+                        "resources": [
+                          "*"
+                        ]
+                      },
+                      "diskio": {
+                        "measurement": [
+                          "io_time"
+                        ],
+                        "metrics_collection_interval": 30,
+                        "resources": [
+                          "*"
+                        ]
+                      },
+                      "mem": {
+                        "measurement": [
+                          "mem_used_percent"
+                        ],
+                        "metrics_collection_interval": 30
+                      },
+                      "statsd": {
+                        "metrics_aggregation_interval": 30,
+                        "metrics_collection_interval": 10,
+                        "service_address": ":8125"
+                      },
+                      "swap": {
+                        "measurement": [
+                          "swap_used_percent"
+                        ],
+                        "metrics_collection_interval": 30
+                      }
+                    }
+                  },
+                  "logs": {
+                    "logs_collected": {
+                      "files": {
+                        "collect_list": [
+                          {
+                            "log_group_name": "/Jenkins-ASG/var/log/cloud-init-output",
+                            "file_path": "/var/log/cloud-init-output.log",
+                            "log_stream_name": "{instance_id}"
+                          },
+                          {
+                            "log_group_name": "/Jenkins-ASG/var/log/cfn-init-output",
+                            "file_path": "/var/log/cfn-init.log",
+                            "log_stream_name": "{instance_id}"
+                          },
+                          {
+                            "log_group_name": "/Jenkins-ASG/var/log/syslog",
+                            "file_path": "/var/log/syslog",
+                            "log_stream_name": "{instance_id}"
+                          }
+                        ]
+                      }
+                    }
+                  }
+                }
+        # Invoke amazon-cloudwatch-agent-ctl to restart the AmazonCloudWatchAgent.
+        03_restart_amazon-cloudwatch-agent:
+          commands:
+            01_stop_service:
+              command: /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl -a stop
+            02_start_service:
+              command: /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl -a fetch-config -m ec2 -c file:/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json -s
+        # Cfn-hup setting, it is to monitor the change of metadata.
+        # When there is change in the contents of json file in the metadata section, cfn-hup will call cfn-init to restart the AmazonCloudWatchAgent.
+        01_setupCfnHup:
+          files:
+             '/etc/cfn/cfn-hup.conf':
+               content: !Sub |
+                 [main]
+                 stack=${AWS::StackId}
+                 region=${AWS::Region}
+                 interval=1
+               mode: '000400'
+               owner: root
+               group: root
+             '/etc/cfn/hooks.d/amazon-cloudwatch-agent-auto-reloader.conf':
+               content: !Sub |
+                 [cfn-auto-reloader-hook]
+                 triggers=post.update
+                 path=Resources.JenkinsLaunchTemplate.Metadata.AWS::CloudFormation::Init.02_config-amazon-cloudwatch-agent
+                 action=/opt/aws/bin/cfn-init -v --stack ${AWS::StackId} --resource JenkinsLaunchTemplate --region ${AWS::Region} --configsets UpdateEnvironment
+                 runas=root
+               mode: '000400'
+               owner: root
+               group: root
+             "/lib/systemd/system/cfn-hup.service":
+                content: !Sub |
+                  [Unit]
+                  Description=cfn-hup daemon
+                  [Service]
+                  Type=simple
+                  ExecStart=/opt/aws/bin/cfn-hup
+                  Restart=always
+                  [Install]
+                  WantedBy=multi-user.target
+          commands:
+            01enable_cfn_hup:
+              command: !Sub |
+                systemctl enable cfn-hup.service
+            02start_cfn_hup:
+              command: !Sub |
+                systemctl start cfn-hup.service
+
+  WebGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Jenkins Web Traffic
+      GroupName: !Sub Jenkins-${Env}-Web-Traffic-SG
+      VpcId:
+        Fn::ImportValue: !Sub ${Env}-VPC
+      Tags:
+        - Key: Name
+          Value: !Sub Jenkins-${Env}-Web-Traffic-SG
+      SecurityGroupIngress:
+        -
+          IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+        -
+          IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+
+  LBGroup:
+    Type: AWS::EC2::SecurityGroup
+    DependsOn: WebGroup
+    Properties:
+      GroupDescription: Jenkins Traffic from LB
+      GroupName: !Sub Jenkins-${Env}-LB-Traffic-SG
+      VpcId:
+        Fn::ImportValue: !Sub ${Env}-VPC
+      Tags:
+        - Key: Name
+          Value: !Sub Jenkins-${Env}-LB-Traffic-SG
+      SecurityGroupIngress:
+        -
+          IpProtocol: tcp
+          FromPort: 8080
+          ToPort: 8080
+          SourceSecurityGroupId: !Ref WebGroup
+
+  JenkinsLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      SecurityGroups:
+        - !Ref WebGroup
+      Subnets:
+        - Fn::ImportValue: !Sub ${Env}-PublicSubnetA
+        - Fn::ImportValue: !Sub ${Env}-PublicSubnetB
+        - Fn::ImportValue: !Sub ${Env}-PublicSubnetC
+
+  JenkinsDNS:
+    Type: AWS::Route53::RecordSetGroup
+    Properties:
+      HostedZoneName: aandsco.people.aws.dev.
+      Comment: Zone apex alias targeted to myELB LoadBalancer.
+      RecordSets:
+        - Name: jenkins.aandsco.people.aws.dev.
+          Type: A
+          AliasTarget:
+            HostedZoneId: !GetAtt 'JenkinsLoadBalancer.CanonicalHostedZoneID'
+            DNSName: !GetAtt 'JenkinsLoadBalancer.DNSName'
+
+  wildcardaandscocomcert:
+    Type: AWS::CertificateManager::Certificate
+    Properties:
+      DomainName: "*.aandsco.people.aws.dev"
+      SubjectAlternativeNames:
+        - aandsco.people.aws.dev
+      DomainValidationOptions:
+            - DomainName: "*.aandsco.people.aws.dev"
+              HostedZoneId: Z0713658ROE81WDVO438
+      ValidationMethod: DNS
+
+  JenkinsLoadBalancerListener80:
+    Type: "AWS::ElasticLoadBalancingV2::Listener"
+    Properties:
+      DefaultActions:
+        - RedirectConfig:
+            Host: '#{host}'
+            Path: '/#{path}'
+            Port: '443'
+            Protocol: HTTPS
+            StatusCode: HTTP_301
+          Type: redirect
+      LoadBalancerArn: !Ref JenkinsLoadBalancer
+      Port: 80
+      Protocol: HTTP
+
+  JenkinsLoadBalancerListener443:
+    Type: "AWS::ElasticLoadBalancingV2::Listener"
+    Properties:
+      DefaultActions:
+        - TargetGroupArn: !Ref JenkinsTargetGroup
+          Type: forward
+      LoadBalancerArn: !Ref JenkinsLoadBalancer
+      Port: 443
+      Protocol: HTTPS
+      Certificates:
+        - CertificateArn: !Ref wildcardaandscocomcert
+
+  JenkinsEC2Role:
+    Type: "AWS::IAM::Role"
+    Properties:
+      RoleName: !Sub ${Env}-EC2-Instance-Role-${AWS::Region}
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          -
+            Effect: "Allow"
+            Principal:
+              Service:
+                - "ec2.amazonaws.com"
+            Action:
+              - "sts:AssumeRole"
+      Path: "/"
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+  JenkinsEC2RolePolicies:
+    Type: "AWS::IAM::Policy"
+    Properties:
+      PolicyName: !Sub "JenkinsEC2${Env}Policy"
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          -
+            Effect: "Allow"
+            Action:
+              - "s3:GetObject"
+              - "s3:PutObject"
+              - "s3:ListBucket*"
+            Resource: "*"
+          -
+            Effect: "Allow"
+            Action:
+              - "kms:Decrypt"
+              - "kms:Encrypt"
+            Resource: "*"
+          -
+            Effect: "Allow"
+            Action: "rds:DescribeDBInstances"
+            Resource: "*"
+          -
+            Effect: "Allow"
+            Action: "elasticfilesystem:DescribeFileSystems"
+            Resource: "*"
+          -
+            Effect: "Allow"
+            Action: "ssm:PutParameter"
+            Resource: "*"
+
+      Roles:
+        -
+          Ref: "JenkinsEC2Role"
+  JenkinsEC2InstanceProfile:
+    Type: "AWS::IAM::InstanceProfile"
+    Properties:
+      Path: "/"
+      Roles:
+        -
+          Ref: "JenkinsEC2Role"
+
+  JenkinsTargetGroup:
+    Type: "AWS::ElasticLoadBalancingV2::TargetGroup"
+    Properties:
+      Name: !Sub Jenkins-${Env}-TG
+      HealthCheckEnabled: true
+      HealthCheckIntervalSeconds: 60
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 10
+      HealthCheckPath: /login
+      HealthCheckPort: '8080'
+      TargetGroupAttributes:
+        - Key: stickiness.enabled
+          Value: true
+        - Key: stickiness.type
+          Value: lb_cookie
+        - Key: deregistration_delay.timeout_seconds
+          Value: 30
+      Port: 8080
+      Protocol: HTTP
+      VpcId:
+        Fn::ImportValue: !Sub ${Env}-VPC
+
+  JenkinsASG:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    DependsOn:
+      - JenkinsTargetGroup
+      - JenkinsLaunchTemplate
+    Properties:
+      AutoScalingGroupName: !Sub Jenkins-${Env}-ASG
+      MinSize: "1"
+      MaxSize: "3"
+      DesiredCapacity: !Ref DesiredInstanceNumber
+      HealthCheckType: ELB
+      HealthCheckGracePeriod: 300
+      LaunchTemplate:
+        LaunchTemplateId: !Ref JenkinsLaunchTemplate
+        Version: !GetAtt JenkinsLaunchTemplate.LatestVersionNumber
+      TargetGroupARNs:
+        - !Ref JenkinsTargetGroup
+      VPCZoneIdentifier:
+        - Fn::ImportValue: !Sub ${Env}-PrivateSubnetA
+        - Fn::ImportValue: !Sub ${Env}-PrivateSubnetB
+        - Fn::ImportValue: !Sub ${Env}-PrivateSubnetC
+      MetricsCollection:
+        - Granularity: "1Minute"
+          Metrics:
+            - "GroupMinSize"
+            - "GroupMaxSize"
+      Tags:
+        - Key: Env
+          Value: !Sub ${Env}
+          PropagateAtLaunch: "true"
+        - Key: Name
+          Value: !Sub Jenkins-ASG-${Env}
+          PropagateAtLaunch: "true"
+    CreationPolicy:
+      ResourceSignal:
+        Timeout: PT15M
+    UpdatePolicy:
+      AutoScalingRollingUpdate:
+        MinInstancesInService: 1
+        MaxBatchSize: 1
+        PauseTime: PT15M
+        SuspendProcesses:
+          - HealthCheck
+          - ReplaceUnhealthy
+          - AZRebalance
+          - AlarmNotification
+          - ScheduledActions
+        WaitOnResourceSignals: true
+
+  WebServerScaleUpPolicy:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AdjustmentType: ChangeInCapacity
+      AutoScalingGroupName: !Ref JenkinsASG
+      Cooldown: '60'
+      ScalingAdjustment: 1
+
+  WebServerScaleDownPolicy:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AdjustmentType: ChangeInCapacity
+      AutoScalingGroupName: !Ref JenkinsASG
+      Cooldown: '60'
+      ScalingAdjustment: -1
+
+  CPUAlarmHigh:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Scale-up if CPU > 90% for 10 minutes
+      MetricName: CPUUtilization
+      Namespace: AWS/EC2
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 90
+      AlarmActions: [!Ref 'WebServerScaleUpPolicy']
+      Dimensions:
+      - Name: AutoScalingGroupName
+        Value: !Ref 'JenkinsASG'
+      ComparisonOperator: GreaterThanThreshold
+
+  CPUAlarmLow:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Scale-down if CPU < 70% for 10 minutes
+      MetricName: CPUUtilization
+      Namespace: AWS/EC2
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 70
+      AlarmActions: [!Ref 'WebServerScaleDownPolicy']
+      Dimensions:
+      - Name: AutoScalingGroupName
+        Value: !Ref 'JenkinsASG'
+      ComparisonOperator: LessThanThreshold
+
+Outputs:
+ JenkinsEC2InstanceProfile:
+   Description: Jenkins EC2 Instance Profile
+   Value: !Ref JenkinsEC2InstanceProfile
+   Export:
+     Name: !Sub ${Env}Jenkins-EC2-Instance-Profile
+ JenkinsEC2InstanceProfileARN:
+   Description: Jenkins EC2 Instance Profile
+   Value: !GetAtt JenkinsEC2InstanceProfile.Arn
+   Export:
+     Name: !Sub ${Env}-Jenkins-Instance-Profile-ARN
+ JenkinsASG:
+   Description: Jenkins ASG
+   Value: !Ref JenkinsASG
+   Export:
+     Name: !Sub ${Env}-Jenkins-ASG
