@@ -1,0 +1,186 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  "POC solution to add automating patching to organization"
+
+Parameters:
+  Env:
+    Type: String
+    AllowedValues:
+      - 'Dev'
+      - 'Test'
+      - 'QA'
+      - 'Prod'
+    Default: 'Dev'
+    Description: The Environment type for deployment.
+  Approval:
+    Type: Number
+    Default: 7
+    Description: The number of days after the release date of each patch matched by the rule that the patch is marked as approved in the patch baseline.
+  ComplianceLevel:
+    Type: String
+    AllowedValues:
+      - 'CRITICAL'
+      - 'HIGH'
+      - 'INFORMATIONAL'
+      - 'MEDIUM'
+      - 'LOW'
+      - 'UNSPECIFIED'
+    Default: 'HIGH'
+    Description: A compliance severity level for all approved patches in a patch baseline.
+  TargetOS:
+    Type: String
+    AllowedValues:
+      - 'AMAZON_LINUX_2'
+      - 'AMAZON_LINUX_2022'
+      - 'AMAZON_LINUX_2023'
+      - 'CENTOS'
+      - 'DEBIAN'
+      - 'MACOS'
+      - 'ORACLE_LINUX'
+      - 'RASPBIAN'
+      - 'REDHAT_ENTERPRISE_LINUX'
+      - 'SUSE'
+      - 'UBUNTU'
+      - 'WINDOWS'
+    Default: 'WINDOWS'
+    Description: Defines the operating system the patch baseline applies to.
+  PatchFilterType:
+    Type: String
+    AllowedValues:
+      - 'CLASSIFICATION'
+      - 'PRIORITY'
+      - 'MSRC_SEVERITY'
+      - 'PRODUCT_FAMILY'
+      - 'SEVERITY'
+      - 'SECURITY'
+      - 'VERSION'
+      - 'CVE_ID'
+    Default: 'CLASSIFICATION'
+    Description: Defines a patch filter for an AWS Systems Manager patch baseline.
+  PatchFilters:
+    Type: CommaDelimitedList
+    Default: CriticalUpdates, SecurityUpdates, Drivers
+    Description: Defines a patch classifications used to filter for an AWS Systems Manager patch baseline.
+  Timeout:
+    Type: Number
+    Default: 1800
+    Description: Defines the timeout for Patch Baseline success.
+  MaintWindowSchedule:
+    Type: String
+    Default: cron(0 0 ? * THU#2 *)
+    Description: The schedule of the maintenance window in the form of a cron or rate expression.
+
+
+Resources:
+  PatchBaseline:
+    Type: AWS::SSM::PatchBaseline
+    Properties:
+      ApprovalRules:
+        PatchRules:
+          - ApproveAfterDays: !Ref Approval
+            ComplianceLevel: !Ref ComplianceLevel
+            EnableNonSecurity: false
+            PatchFilterGroup:
+              PatchFilters:
+                - Key: !Ref PatchFilterType
+                  Values:
+                    !Ref PatchFilters
+      Description: !Sub This patch baseline defines which patches are approved for installation on your instances in ${Env} environment.
+      Name: !Sub ${TargetOS}-${Env}-Baseline
+      OperatingSystem: !Ref TargetOS
+      PatchGroups:
+        - !Ref TargetOS
+
+  ScanPatchBaselineAssociation:
+    Type: AWS::SSM::Association
+    Properties:
+      AssociationName: !Sub ${TargetOS}-${Env}-Scan-Baseline
+      Name: AWS-RunPatchBaseline
+      ScheduleExpression: cron(15 23 ? * * *)
+      OutputLocation:
+        S3Location:
+          OutputS3BucketName: !Ref S3Bucket
+          OutputS3KeyPrefix: !Sub ${Env}/${AWS::AccountId}/${TargetOS}-Scan-Baseline
+      Parameters:
+        Operation:
+          - Scan
+      Targets:
+        - Key: tag:OS
+          Values:
+            - !Ref TargetOS
+      WaitForSuccessTimeoutSeconds: !Ref Timeout
+
+  InstallPatchBaselineAssociation:
+    Type: AWS::SSM::Association
+    Properties:
+      AssociationName: !Sub ${TargetOS}-${Env}-Install-Baseline
+      Name: AWS-RunPatchBaseline
+      OutputLocation:
+        S3Location:
+          OutputS3BucketName: !Ref S3Bucket
+          OutputS3KeyPrefix: !Sub ${Env}/${AWS::AccountId}/${TargetOS}-Install-Baseline
+      Parameters:
+        Operation:
+          - Install
+      Targets:
+        - Key: tag:OS
+          Values:
+            - !Ref TargetOS
+      WaitForSuccessTimeoutSeconds: !Ref Timeout
+
+  MaintenanceWindow:
+    Type: AWS::SSM::MaintenanceWindow
+    Properties:
+      AllowUnassociatedTargets: true
+      Cutoff: 1
+      Description: Maintenance Window to install patch baseline
+      Duration: 4
+      Name: !Sub ${TargetOS}-${Env}-Install-Baseline
+      Schedule: !Ref MaintWindowSchedule
+      ScheduleTimezone: GB
+
+  MaintenanceWindowTarget:
+    Type: AWS::SSM::MaintenanceWindowTarget
+    Properties:
+      WindowId: !Ref MaintenanceWindow
+      ResourceType: INSTANCE
+      Targets:
+      - Key: tag:OS
+        Values:
+        - !Ref TargetOS
+      Name: !Sub ${TargetOS}-${Env}-Install-Baseline
+      Description: Maintenance Window to install patch baseline
+
+  MaintenanceWindowTask:
+    Type: AWS::SSM::MaintenanceWindowTask
+    Properties:
+      Name: !Sub ${TargetOS}-${Env}-Install-Baseline
+      Description: Apply OS patches on instances in target
+      MaxConcurrency: 25%
+      MaxErrors: 1
+      Priority: 0
+      TaskType: RUN_COMMAND
+      WindowId:
+        Ref: MaintenanceWindow
+      TaskArn: AWS-RunPatchBaseline
+      TaskInvocationParameters:
+        MaintenanceWindowRunCommandParameters:
+          OutputS3BucketName: !Ref S3Bucket
+          OutputS3KeyPrefix: !Sub ${Env}/${AWS::AccountId}/${TargetOS}-Install-Baseline
+          Parameters:
+            Operation:
+            - Install
+            RebootOption:
+            - RebootifNeeded
+      Targets:
+      - Key: WindowTargetIds
+        Values:
+        - Ref: MaintenanceWindowTarget
+
+  S3Bucket:
+    Type: 'AWS::S3::Bucket'
+    Properties:
+      BucketName: !Sub ${AWS::AccountId}-${AWS::Region}-install-baseline-logs
+      AccessControl: Private
+      
+# Outputs:

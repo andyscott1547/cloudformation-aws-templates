@@ -1,0 +1,11 @@
+# macOs
+.DS_Store
+
+# Project
+keys/
+
+# vscode
+.vscode
+
+# intellij and pycharm
+.idea
