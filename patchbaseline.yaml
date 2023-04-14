@@ -20,9 +20,13 @@ Parameters:
     Type: Number
     Default: 7
     Description: The number of days after the release date of each patch matched by the rule that the patch is marked as approved in the patch baseline.
+  AL2Approval:
+    Type: Number
+    Default: 7
+    Description: The number of days after the release date of each patch matched by the rule that the patch is marked as approved in the patch baseline.
   Timeout:
     Type: Number
-    Default: 1800
+    Default: 3600
     Description: Defines the timeout for Patch Baseline success.
   WindowsMaintWindowSchedule:
     Type: String
@@ -32,6 +36,14 @@ Parameters:
     Type: String
     Default: cron(0 0 ? * SUN#2 *)
     Description: The schedule of the maintenance window in the form of a cron or rate expression.
+  AL2MaintWindowSchedule:
+    Type: String
+    Default: cron(0 0 ? * SAT#2 *)
+    Description: The schedule of the maintenance window in the form of a cron or rate expression.
+  ScanSchedule:
+    Type: String
+    Default: cron(15 23 ? * * *)
+    Description: The schedule of the baseline scan in the form of a cron or rate expression.
 
 
 Resources:
@@ -47,7 +59,7 @@ Resources:
               PatchFilters:
                 - Key: "PRODUCT"
                   Values:
-                    - WindowsServer2019
+                    - "*"
                 - Key: CLASSIFICATION
                   Values:
                     - CriticalUpdates
@@ -63,43 +75,6 @@ Resources:
       OperatingSystem: WINDOWS
       PatchGroups:
         - WINDOWS
-
-  WindowsScanPatchBaselineAssociation:
-    Type: AWS::SSM::Association
-    Properties:
-      AssociationName: !Sub Windows-${Env}-Scan-Baseline
-      Name: AWS-RunPatchBaseline
-      ScheduleExpression: cron(15 23 ? * * *)
-      OutputLocation:
-        S3Location:
-          OutputS3BucketName: !Ref S3Bucket
-          OutputS3KeyPrefix: !Sub ${Env}/${AWS::AccountId}/Windows-Scan-Baseline
-      Parameters:
-        Operation:
-          - Scan
-      Targets:
-        - Key: tag:OS
-          Values:
-            - WINDOWS
-      WaitForSuccessTimeoutSeconds: !Ref Timeout
-
-  WindowsInstallPatchBaselineAssociation:
-    Type: AWS::SSM::Association
-    Properties:
-      AssociationName: !Sub Windows-${Env}-Install-Baseline
-      Name: AWS-RunPatchBaseline
-      OutputLocation:
-        S3Location:
-          OutputS3BucketName: !Ref S3Bucket
-          OutputS3KeyPrefix: !Sub ${Env}/${AWS::AccountId}/Windows-Install-Baseline
-      Parameters:
-        Operation:
-          - Install
-      Targets:
-        - Key: tag:OS
-          Values:
-            - WINDOWS
-      WaitForSuccessTimeoutSeconds: !Ref Timeout
 
   WindowsMaintenanceWindow:
     Type: AWS::SSM::MaintenanceWindow
@@ -118,7 +93,10 @@ Resources:
       WindowId: !Ref WindowsMaintenanceWindow
       ResourceType: INSTANCE
       Targets:
-      - Key: tag:OS
+      - Key: tag:Auto_Patch
+        Values:
+        - "true"
+      - Key: tag:PatchGroup
         Values:
         - WINDOWS
       Name: !Sub Windows-${Env}-Install-Baseline
@@ -177,43 +155,6 @@ Resources:
       PatchGroups:
         - REDHAT_ENTERPRISE_LINUX
 
-  RHELScanPatchBaselineAssociation:
-    Type: AWS::SSM::Association
-    Properties:
-      AssociationName: !Sub RHEL-${Env}-Scan-Baseline
-      Name: AWS-RunPatchBaseline
-      ScheduleExpression: cron(15 23 ? * * *)
-      OutputLocation:
-        S3Location:
-          OutputS3BucketName: !Ref S3Bucket
-          OutputS3KeyPrefix: !Sub ${Env}/${AWS::AccountId}/RHEL-Scan-Baseline
-      Parameters:
-        Operation:
-          - Scan
-      Targets:
-        - Key: tag:OS
-          Values:
-            - REDHAT_ENTERPRISE_LINUX
-      WaitForSuccessTimeoutSeconds: !Ref Timeout
-
-  RHELInstallPatchBaselineAssociation:
-    Type: AWS::SSM::Association
-    Properties:
-      AssociationName: !Sub RHEL-${Env}-Install-Baseline
-      Name: AWS-RunPatchBaseline
-      OutputLocation:
-        S3Location:
-          OutputS3BucketName: !Ref S3Bucket
-          OutputS3KeyPrefix: !Sub ${Env}/${AWS::AccountId}/RHEL-Install-Baseline
-      Parameters:
-        Operation:
-          - Install
-      Targets:
-        - Key: tag:OS
-          Values:
-            - REDHAT_ENTERPRISE_LINUX
-      WaitForSuccessTimeoutSeconds: !Ref Timeout
-
   RHELMaintenanceWindow:
     Type: AWS::SSM::MaintenanceWindow
     Properties:
@@ -231,7 +172,10 @@ Resources:
       WindowId: !Ref RHELMaintenanceWindow
       ResourceType: INSTANCE
       Targets:
-      - Key: tag:OS
+      - Key: tag:Auto_Patch
+        Values:
+        - "true"
+      - Key: tag:PatchGroup
         Values:
         - REDHAT_ENTERPRISE_LINUX
       Name: !Sub RHEL-${Env}-Install-Baseline
@@ -262,6 +206,128 @@ Resources:
       - Key: WindowTargetIds
         Values:
         - Ref: RHELMaintenanceWindowTarget
+
+  AL2PatchBaseline:
+    Type: AWS::SSM::PatchBaseline
+    Properties:
+      ApprovalRules:
+        PatchRules:
+          - ApproveAfterDays: !Ref AL2Approval
+            ComplianceLevel: HIGH
+            EnableNonSecurity: true
+            PatchFilterGroup:
+              PatchFilters:
+                - Key: "PRODUCT"
+                  Values:
+                    - "*"
+                - Key: CLASSIFICATION
+                  Values:
+                    - "*"
+                - Key: SEVERITY
+                  Values:
+                    - Critical
+                    - Important
+                    - Medium
+      Description: !Sub This patch baseline defines which patches are approved for installation on your instances in ${Env} environment.
+      Name: !Sub AL2-${Env}-Baseline
+      OperatingSystem: AMAZON_LINUX_2
+      PatchGroups:
+        - AMAZON_LINUX_2
+
+  AL2MaintenanceWindow:
+    Type: AWS::SSM::MaintenanceWindow
+    Properties:
+      AllowUnassociatedTargets: true
+      Cutoff: 1
+      Description: Maintenance Window to install patch baseline
+      Duration: 4
+      Name: !Sub AL2-${Env}-Install-Baseline
+      Schedule: !Ref AL2MaintWindowSchedule
+      ScheduleTimezone: GB
+
+  AL2MaintenanceWindowTarget:
+    Type: AWS::SSM::MaintenanceWindowTarget
+    Properties:
+      WindowId: !Ref AL2MaintenanceWindow
+      ResourceType: INSTANCE
+      Targets:
+      - Key: tag:Auto_Patch
+        Values:
+        - "true"
+      - Key: tag:PatchGroup
+        Values:
+        - AMAZON_LINUX_2
+      Name: !Sub AL2-${Env}-Install-Baseline
+      Description: Maintenance Window to install patch baseline
+
+  AL2MaintenanceWindowTask:
+    Type: AWS::SSM::MaintenanceWindowTask
+    Properties:
+      Name: !Sub AL2-${Env}-Install-Baseline
+      Description: Apply OS patches on instances in target
+      MaxConcurrency: 25%
+      MaxErrors: 1
+      Priority: 0
+      TaskType: RUN_COMMAND
+      WindowId:
+        Ref: AL2MaintenanceWindow
+      TaskArn: AWS-RunPatchBaseline
+      TaskInvocationParameters:
+        MaintenanceWindowRunCommandParameters:
+          OutputS3BucketName: !Ref S3Bucket
+          OutputS3KeyPrefix: !Sub ${Env}/${AWS::AccountId}/AL2-Install-Baseline
+          Parameters:
+            Operation:
+            - Install
+            RebootOption:
+            - RebootifNeeded
+      Targets:
+      - Key: WindowTargetIds
+        Values:
+        - Ref: AL2MaintenanceWindowTarget
+
+  AllScanPatchBaselineAssociation:
+    Type: AWS::SSM::Association
+    Properties:
+      AssociationName: !Sub All-OS-${Env}-Scan-Baseline
+      Name: AWS-RunPatchBaseline
+      ScheduleExpression: !Ref ScanSchedule 
+      OutputLocation:
+        S3Location:
+          OutputS3BucketName: !Ref S3Bucket
+          OutputS3KeyPrefix: !Sub ${Env}/${AWS::AccountId}/All-OS-Scan-Baseline
+      Parameters:
+        Operation:
+          - Scan
+      Targets:
+      - Key: tag:PatchGroup
+        Values:
+        - REDHAT_ENTERPRISE_LINUX
+        - WINDOWS
+      WaitForSuccessTimeoutSeconds: !Ref Timeout
+
+  AllInstallPatchBaselineAssociation:
+    Type: AWS::SSM::Association
+    Properties:
+      Name: AWS-RunPatchBaseline
+      AssociationName: !Sub All-OS-${Env}-Install-Baseline
+      MaxConcurrency: 25%
+      MaxErrors: 1
+      OutputLocation:
+        S3Location:
+          OutputS3BucketName: !Ref S3Bucket
+          OutputS3KeyPrefix: !Sub ${Env}/${AWS::AccountId}/All-OS-Install-Baseline
+      Parameters:
+        Operation:
+          - Install
+        RebootOption:
+          - RebootIfNeeded
+      Targets:
+      - Key: tag:PatchGroup
+        Values:
+        - REDHAT_ENTERPRISE_LINUX
+        - WINDOWS
+      WaitForSuccessTimeoutSeconds: !Ref Timeout
 
   S3Bucket:
     Type: 'AWS::S3::Bucket'
