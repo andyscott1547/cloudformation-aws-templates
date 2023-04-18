@@ -26,7 +26,7 @@ Parameters:
     Description: The number of days after the release date of each patch matched by the rule that the patch is marked as approved in the patch baseline.
   Timeout:
     Type: Number
-    Default: 3600
+    Default: 1800
     Description: Defines the timeout for Patch Baseline success.
   WindowsMaintWindowSchedule:
     Type: String
@@ -44,6 +44,9 @@ Parameters:
     Type: String
     Default: cron(15 23 ? * * *)
     Description: The schedule of the baseline scan in the form of a cron or rate expression.
+  # LoggingBucket:
+  #   Type: String
+  #   Description: The S3 access logging bucket name.
 
 
 Resources:
@@ -75,6 +78,9 @@ Resources:
       OperatingSystem: WINDOWS
       PatchGroups:
         - WINDOWS
+      Tags:
+      - Key: Example
+        Value: True
 
   WindowsMaintenanceWindow:
     Type: AWS::SSM::MaintenanceWindow
@@ -86,6 +92,9 @@ Resources:
       Name: !Sub Windows-${Env}-Install-Baseline
       Schedule: !Ref WindowsMaintWindowSchedule
       ScheduleTimezone: GB
+      Tags:
+      - Key: Example
+        Value: True
 
   WindowsMaintenanceWindowTarget:
     Type: AWS::SSM::MaintenanceWindowTarget
@@ -93,9 +102,9 @@ Resources:
       WindowId: !Ref WindowsMaintenanceWindow
       ResourceType: INSTANCE
       Targets:
-      - Key: tag:Auto_Patch
+      - Key: tag:AutoPatch
         Values:
-        - "true"
+        - "True"
       - Key: tag:PatchGroup
         Values:
         - WINDOWS
@@ -154,6 +163,9 @@ Resources:
       OperatingSystem: REDHAT_ENTERPRISE_LINUX
       PatchGroups:
         - REDHAT_ENTERPRISE_LINUX
+      Tags:
+      - Key: Example
+        Value: True
 
   RHELMaintenanceWindow:
     Type: AWS::SSM::MaintenanceWindow
@@ -165,6 +177,9 @@ Resources:
       Name: !Sub RHEL-${Env}-Install-Baseline
       Schedule: !Ref RHELMaintWindowSchedule
       ScheduleTimezone: GB
+      Tags:
+      - Key: Example
+        Value: True
 
   RHELMaintenanceWindowTarget:
     Type: AWS::SSM::MaintenanceWindowTarget
@@ -172,9 +187,9 @@ Resources:
       WindowId: !Ref RHELMaintenanceWindow
       ResourceType: INSTANCE
       Targets:
-      - Key: tag:Auto_Patch
+      - Key: tag:AutoPatch
         Values:
-        - "true"
+        - "True"
       - Key: tag:PatchGroup
         Values:
         - REDHAT_ENTERPRISE_LINUX
@@ -233,6 +248,9 @@ Resources:
       OperatingSystem: AMAZON_LINUX_2
       PatchGroups:
         - AMAZON_LINUX_2
+      Tags:
+      - Key: Example
+        Value: True
 
   AL2MaintenanceWindow:
     Type: AWS::SSM::MaintenanceWindow
@@ -244,6 +262,9 @@ Resources:
       Name: !Sub AL2-${Env}-Install-Baseline
       Schedule: !Ref AL2MaintWindowSchedule
       ScheduleTimezone: GB
+      Tags:
+      - Key: Example
+        Value: True
 
   AL2MaintenanceWindowTarget:
     Type: AWS::SSM::MaintenanceWindowTarget
@@ -251,9 +272,9 @@ Resources:
       WindowId: !Ref AL2MaintenanceWindow
       ResourceType: INSTANCE
       Targets:
-      - Key: tag:Auto_Patch
+      - Key: tag:AutoPatch
         Values:
-        - "true"
+        - "True"
       - Key: tag:PatchGroup
         Values:
         - AMAZON_LINUX_2
@@ -305,7 +326,7 @@ Resources:
         - REDHAT_ENTERPRISE_LINUX
         - WINDOWS
         - AMAZON_LINUX_2
-      WaitForSuccessTimeoutSeconds: !Ref Timeout
+      WaitForSuccessTimeoutSeconds: 300
 
   AllInstallPatchBaselineAssociation:
     Type: AWS::SSM::Association
@@ -329,81 +350,49 @@ Resources:
         - REDHAT_ENTERPRISE_LINUX
         - WINDOWS
         - AMAZON_LINUX_2
-      WaitForSuccessTimeoutSeconds: !Ref Timeout
+      WaitForSuccessTimeoutSeconds: 300
 
   S3Bucket:
     Type: 'AWS::S3::Bucket'
     Properties:
       BucketName: !Sub ${AWS::AccountId}-${AWS::Region}-install-baseline-logs
       AccessControl: Private
-      
-  # WindowsDefaultBaselineCustomResource:
-  #   Type: "Custom::DefaultPatchBaseline"
-  #   Properties:
-  #     PatchBaselinId:
-  #       Ref: "WindowsPatchBaseline"
-  #     OperatingSystem: "WINDOWS"
-  #     ServiceToken:
-  #       Fn::GetAtt:
-  #         - "DefaultBaselineLambda"
-  #         - "Arn"
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - BucketKeyEnabled: false
+            ServerSideEncryptionByDefault:
+              SSEAlgorithm: "aws:kms"
+              KMSMasterKeyID: "aws/s3"
+      VersioningConfiguration:
+        Status: "Suspended"
+      # LoggingConfiguration:
+      #   DestinationBucketName: !Ref LoggingBucket
+      #   LogFilePrefix: !Sub ${Env}/${AWS::AccountId}/${AWS::Region}/install-baseline-logs
+      Tags:
+      - Key: Example
+        Value: True
 
-  # RHELDefaultBaselineCustomResource:
-  #   Type: "Custom::DefaultPatchBaseline"
-  #   Properties:
-  #     PatchBaselinId:
-  #       Ref: "RHELPatchBaseline"
-  #     OperatingSystem: "REDHAT_ENTERPRISE_LINUX"
-  #     ServiceToken:
-  #       Fn::GetAtt:
-  #         - "DefaultBaselineLambda"
-  #         - "Arn"
+  S3BucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref S3Bucket
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Action:
+              - "s3:*"
+            Effect: Deny
+            Resource:
+              - !GetAtt S3Bucket.Arn
+              - !Sub ${S3Bucket.Arn}/*
+            Principal: '*'
+            Condition:
+              Bool:
+                "aws:SecureTransport": "false"
 
-  # AL2DefaultBaselineCustomResource:
-  #   Type: "Custom::DefaultPatchBaseline"
-  #   Properties:
-  #     PatchBaselinId:
-  #       Ref: "AL2PatchBaseline"
-  #     OperatingSystem: "AMAZON_LINUX_2"
-  #     ServiceToken:
-  #       Fn::GetAtt:
-  #         - "DefaultBaselineLambda"
-  #         - "Arn"
-
-  # CustomResourceIamRole:
-  #   Type: "AWS::IAM::Role"
-  #   Properties:
-  #     AssumeRolePolicyDocument:
-  #       Version: "2012-10-17"
-  #       Statement:
-  #         - Effect: "Allow"
-  #           Principal:
-  #             Service: "lambda.amazonaws.com"
-  #           Action:
-  #             - "sts:AssumeRole"
-  #     Path: "/"
-  #     ManagedPolicyArns: []
-  #     Policies:
-  #       - PolicyName: "ssm-patch-baseline"
-  #         PolicyDocument:
-  #           Statement:
-  #             - Effect: "Allow"
-  #               Action:
-  #                 - "ssm:DescribePatchBaselines"
-  #                 - "ssm:RegisterDefaultPatchBaseline"
-  #               Resource: "*"
-
-  # DefaultBaselineLambda:
-  #   Type: "AWS::Lambda::Function"
-  #   Properties:
-  #     Code:
-  #       ZipFile: "'use strict';\nconst AWS = require('aws-sdk');\nconst response = require('./cfn-response');\nconst ssm = new AWS.SSM();\n\nexports.handler = (event, context, cb) => {\n  console.log('Invoke:', JSON.stringify(event));\n  const done = (err, data) => {\n    if (err) {\n      console.log('Error: ', err);\n      response.send(event, context, response.FAILED, {}, 'CustomResourcePhysicalID');\n    } else {\n      console.log('Data: ', data)\n      response.send(event, context, response.SUCCESS, {}, 'CustomResourcePhysicalID');\n    }\n  };\n\n  if (event.RequestType === 'Create' || event.RequestType === 'Update') {\n    ssm.registerDefaultPatchBaseline({\n        BaselineId: event.ResourceProperties.PatchBaselinId\n    }, done)\n\n  }\n  else if (event.RequestType === 'Delete'){\n    // on delete, the patch baseline is set to the default AWS patch baseline (For windows, there are three default patch baselines, the 'AWS-DefaultPatchBaseline' is selected)\n    ssm.describePatchBaselines({\n        Filters: [{Key:'OWNER', Values:['AWS']}]\n    }, function(err,data){\n        if (err) done(err,data)\n        else {\n            const defaultPatchBaselines = data.BaselineIdentities.filter((baseline) => baseline.OperatingSystem === event.ResourceProperties.OperatingSystem)\n            \n            \n            \n            ssm.registerDefaultPatchBaseline({\n                BaselineId: (event.ResourceProperties.OperatingSystem === 'WINDOWS')\n                                ? defaultPatchBaselines.filter((baseline) => baseline.BaselineName === 'AWS-DefaultPatchBaseline')[0].BaselineId\n                                : defaultPatchBaselines[0].BaselineId\n            }, done)\n            \n        }\n    })\n  }\n};\n"
-  #     Handler: "index.handler"
-  #     MemorySize: 128
-  #     Role:
-  #       Fn::GetAtt:
-  #         - "CustomResourceIamRole"
-  #         - "Arn"
-  #     Runtime: "nodejs16.x"
-  #     Timeout: 120
 # Outputs:
