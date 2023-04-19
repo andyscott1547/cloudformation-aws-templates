@@ -12,18 +12,6 @@ Parameters:
       - 'Prod'
     Default: 'Dev'
     Description: The Environment type for deployment.
-  WindowsApproval:
-    Type: Number
-    Default: 7
-    Description: The number of days after the release date of each patch matched by the rule that the patch is marked as approved in the patch baseline.
-  RHELApproval:
-    Type: Number
-    Default: 7
-    Description: The number of days after the release date of each patch matched by the rule that the patch is marked as approved in the patch baseline.
-  AL2Approval:
-    Type: Number
-    Default: 7
-    Description: The number of days after the release date of each patch matched by the rule that the patch is marked as approved in the patch baseline.
   Timeout:
     Type: Number
     Default: 1800
@@ -55,7 +43,21 @@ Resources:
     Properties:
       ApprovalRules:
         PatchRules:
-          - ApproveAfterDays: !Ref WindowsApproval
+          - ApproveAfterDays: 30
+            ComplianceLevel: CRITICAL
+            EnableNonSecurity: false
+            PatchFilterGroup:
+              PatchFilters:
+                - Key: "PRODUCT"
+                  Values:
+                    - "*"
+                - Key: CLASSIFICATION
+                  Values:
+                    - "*"
+                - Key: MSRC_SEVERITY
+                  Values:
+                    - Critical
+          - ApproveAfterDays: 60
             ComplianceLevel: HIGH
             EnableNonSecurity: false
             PatchFilterGroup:
@@ -65,13 +67,23 @@ Resources:
                     - "*"
                 - Key: CLASSIFICATION
                   Values:
-                    - CriticalUpdates
-                    - SecurityUpdates
-                    - Updates
+                    - "*"
                 - Key: MSRC_SEVERITY
                   Values:
-                    - Critical
                     - Important
+          - ApproveAfterDays: 90
+            ComplianceLevel: MEDIUM
+            EnableNonSecurity: false
+            PatchFilterGroup:
+              PatchFilters:
+                - Key: "PRODUCT"
+                  Values:
+                    - "*"
+                - Key: CLASSIFICATION
+                  Values:
+                    - "*"
+                - Key: MSRC_SEVERITY
+                  Values:
                     - Moderate
       Description: !Sub This patch baseline defines which patches are approved for installation on your instances in ${Env} environment.
       Name: !Sub Windows-${Env}-Baseline
@@ -142,8 +154,8 @@ Resources:
     Properties:
       ApprovalRules:
         PatchRules:
-          - ApproveAfterDays: !Ref RHELApproval
-            ComplianceLevel: HIGH
+          - ApproveAfterDays: 30
+            ComplianceLevel: CRITICAL
             EnableNonSecurity: true
             PatchFilterGroup:
               PatchFilters:
@@ -156,7 +168,33 @@ Resources:
                 - Key: SEVERITY
                   Values:
                     - Critical
+          - ApproveAfterDays: 60
+            ComplianceLevel: HIGH
+            EnableNonSecurity: true
+            PatchFilterGroup:
+              PatchFilters:
+                - Key: "PRODUCT"
+                  Values:
+                    - "*"
+                - Key: CLASSIFICATION
+                  Values:
+                    - "*"
+                - Key: SEVERITY
+                  Values:
                     - Important
+          - ApproveAfterDays: 90
+            ComplianceLevel: MEDIUM
+            EnableNonSecurity: true
+            PatchFilterGroup:
+              PatchFilters:
+                - Key: "PRODUCT"
+                  Values:
+                    - "*"
+                - Key: CLASSIFICATION
+                  Values:
+                    - "*"
+                - Key: SEVERITY
+                  Values:
                     - Moderate
       Description: !Sub This patch baseline defines which patches are approved for installation on your instances in ${Env} environment.
       Name: !Sub RHEL-${Env}-Baseline
@@ -227,8 +265,8 @@ Resources:
     Properties:
       ApprovalRules:
         PatchRules:
-          - ApproveAfterDays: !Ref AL2Approval
-            ComplianceLevel: HIGH
+          - ApproveAfterDays: 30
+            ComplianceLevel: CRITICAL
             EnableNonSecurity: true
             PatchFilterGroup:
               PatchFilters:
@@ -241,7 +279,33 @@ Resources:
                 - Key: SEVERITY
                   Values:
                     - Critical
+          - ApproveAfterDays: 60
+            ComplianceLevel: HIGH
+            EnableNonSecurity: true
+            PatchFilterGroup:
+              PatchFilters:
+                - Key: "PRODUCT"
+                  Values:
+                    - "*"
+                - Key: CLASSIFICATION
+                  Values:
+                    - "*"
+                - Key: SEVERITY
+                  Values:
                     - Important
+          - ApproveAfterDays: 90
+            ComplianceLevel: MEDIUM
+            EnableNonSecurity: true
+            PatchFilterGroup:
+              PatchFilters:
+                - Key: "PRODUCT"
+                  Values:
+                    - "*"
+                - Key: CLASSIFICATION
+                  Values:
+                    - "*"
+                - Key: SEVERITY
+                  Values:
                     - Medium
       Description: !Sub This patch baseline defines which patches are approved for installation on your instances in ${Env} environment.
       Name: !Sub AL2-${Env}-Baseline
