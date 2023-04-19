@@ -364,18 +364,19 @@ Resources:
         RestrictPublicBuckets: true
       BucketEncryption:
         ServerSideEncryptionConfiguration:
-          - BucketKeyEnabled: false
+          - BucketKeyEnabled: true
             ServerSideEncryptionByDefault:
               SSEAlgorithm: "aws:kms"
-              KMSMasterKeyID: "aws/s3"
+              KMSMasterKeyID: !GetAtt S3BucketKey.Arn
       VersioningConfiguration:
-        Status: "Suspended"
+        Status: "Enabled"
       # LoggingConfiguration:
       #   DestinationBucketName: !Ref LoggingBucket
       #   LogFilePrefix: !Sub ${Env}/${AWS::AccountId}/${AWS::Region}/install-baseline-logs
       Tags:
       - Key: Example
         Value: True
+    DeletionPolicy: Delete
 
   S3BucketPolicy:
     Type: AWS::S3::BucketPolicy
@@ -394,5 +395,31 @@ Resources:
             Condition:
               Bool:
                 "aws:SecureTransport": "false"
+
+  S3BucketKey:
+    Type: 'AWS::KMS::Key'
+    Properties:
+      EnableKeyRotation: true
+      PendingWindowInDays: 14
+      KeyPolicy:
+        Version: 2012-10-17
+        Id: key-default-1
+        Statement:
+          - Sid: Enable IAM User Permissions
+            Effect: Allow
+            Principal:
+              AWS: 
+              - !Sub arn:aws:iam::${AWS::AccountId}:root
+            Action: 'kms:*'
+            Resource: '*'
+      Tags:
+      - Key: Example
+        Value: True
+
+  S3BucketKeyAlias:
+    Type: 'AWS::KMS::Alias'
+    Properties:
+      AliasName: alias/patch-manager-s3-logs
+      TargetKeyId: !Ref S3BucketKey
 
 # Outputs:
